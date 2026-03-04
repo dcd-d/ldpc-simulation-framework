@@ -7,43 +7,35 @@
 /* ==========================================
  * 物理参数宏定义 (推荐 Debug 配置)
  * ========================================== */
-// #define DATA_BYTES 8
-#define DATA_BYTES 4096
+/* ==========================================
+ * 物理 NAND 页面结构定义 (包含 Payload & OOB)
+ * ========================================== */
+#define USER_DATA_BYTES  4096
+#define USER_CRC_BYTES   4
+#define META_DATA_BYTES  16
+#define META_CRC_BYTES   4
 
-#if DATA_BYTES == 4096
-#define DATA_BYTES 4096
+// 丢给 LDPC 编码器的总净荷 (Payload) = 4096 + 4 + 16 + 4 = 4120 Bytes
+#define LDPC_PAYLOAD_BYTES (USER_DATA_BYTES + USER_CRC_BYTES + META_DATA_BYTES + META_CRC_BYTES)
+#define LDPC_PAYLOAD_BITS  (LDPC_PAYLOAD_BYTES * 8) // 32960 bits
+
 #define PARITY_BYTES 512
-#define DATA_BITS (DATA_BYTES * 8)
-#define PARITY_BITS (PARITY_BYTES * 8)
-#define CODEWORD_BITS (DATA_BITS + PARITY_BITS)
+#define PARITY_BITS (PARITY_BYTES * 8) // 4096 bits
 
+// 最终落盘的总长度 (Codeword) = 4120 + 512 = 4632 Bytes
+#define CODEWORD_BITS (LDPC_PAYLOAD_BITS + PARITY_BITS) 
+
+/* QC-LDPC 矩阵参数 (完美整除: 32960 / 64 = 515 列) */
 #define LIFTING_FACTOR 64
-#define NUM_DATA_BLOCKS (DATA_BITS / LIFTING_FACTOR)
+#define NUM_DATA_BLOCKS (LDPC_PAYLOAD_BITS / LIFTING_FACTOR) 
 #define NUM_CHK_BLOCKS (PARITY_BITS / LIFTING_FACTOR)
 #define COLUMN_WEIGHT 4
 
 #define MAX_ITERATIONS 20
 #define MAX_HARD_ITERS 1000
 
-#elif DATA_BYTES == 8
-/* ==========================================
- * 推荐 Debug 配置 (Data: 8B, Parity: 2B)
- * ========================================== */
-#define DATA_BYTES 8
-#define PARITY_BYTES 2
-
-#define DATA_BITS (DATA_BYTES * 8)              // 64 bits
-#define PARITY_BITS (PARITY_BYTES * 8)          // 16 bits
-#define CODEWORD_BITS (DATA_BITS + PARITY_BITS) // 80 bits
-
-#define LIFTING_FACTOR 4                              // 矩阵由 4x4 的小块组成
-#define NUM_DATA_BLOCKS (DATA_BITS / LIFTING_FACTOR)  // 16 列
-#define NUM_CHK_BLOCKS (PARITY_BITS / LIFTING_FACTOR) // 4 行
-#define COLUMN_WEIGHT 3                               // 每列 3 个非零块
-
-#define MAX_ITERATIONS 100
-#define MAX_HARD_ITERS 5000
-#endif
+/* 注意：你需要把后续代码里原本使用 LDPC_PAYLOAD_BITS 的地方，
+   全部全局替换为 LDPC_PAYLOAD_BITS */
 
 /* ==========================================
  * 数据结构与全局状态
@@ -242,7 +234,7 @@ int ldpc_engine_init(void)
     for (i = 0; i < PARITY_BITS; i++)
     {
         g_check_nodes[i].degree++;
-        g_var_nodes[DATA_BITS + i].degree++;
+        g_var_nodes[LDPC_PAYLOAD_BITS + i].degree++;
     }
 
     /* 精准分配内存并重置游标 */
@@ -277,9 +269,9 @@ int ldpc_engine_init(void)
     /* 校验区对角线连线补充 */
     for (i = 0; i < PARITY_BITS; i++)
     {
-        g_check_nodes[i].connected_vns[g_check_nodes[i].degree++] = DATA_BITS + i;
-        g_var_nodes[DATA_BITS + i]
-            .connected_cns[g_var_nodes[DATA_BITS + i].degree++] = i;
+        g_check_nodes[i].connected_vns[g_check_nodes[i].degree++] = LDPC_PAYLOAD_BITS + i;
+        g_var_nodes[LDPC_PAYLOAD_BITS + i]
+            .connected_cns[g_var_nodes[LDPC_PAYLOAD_BITS + i].degree++] = i;
     }
 
     g_is_initialized = 1;
@@ -305,14 +297,81 @@ void ldpc_engine_cleanup(void)
 }
 
 /* ==========================================
+ * 模块 1.5: 数据完整性引擎 (CRC32 & Page Packer)
+ * ========================================== */
+
+// 标准的 IEEE 802.3 CRC-32 算法 (硬件中通常是一组并发 XOR 门)
+unsigned int calculate_crc32(const unsigned char *data, int length) {
+    unsigned int crc = 0xFFFFFFFF;
+    for (int i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            // 经典的 0xEDB88320 多项式
+            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1))); 
+        }
+    }
+    return ~crc;
+}
+
+// 固件流水线：将 Host 数据、Meta 及 CRC 组装成一个完整的 LDPC Payload
+void pack_nand_page(const unsigned char *user_data, const unsigned char *meta_data, unsigned char *ldpc_payload) {
+    int offset = 0;
+
+    // 1. 拷贝 User Data (4096B)
+    memcpy(ldpc_payload + offset, user_data, USER_DATA_BYTES);
+    offset += USER_DATA_BYTES;
+
+    // 2. 计算并追加 User CRC (4B)
+    unsigned int user_crc = calculate_crc32(user_data, USER_DATA_BYTES);
+    memcpy(ldpc_payload + offset, &user_crc, USER_CRC_BYTES);
+    offset += USER_CRC_BYTES;
+
+    // 3. 拷贝 Meta Data (16B)
+    memcpy(ldpc_payload + offset, meta_data, META_DATA_BYTES);
+    offset += META_DATA_BYTES;
+
+    // 4. 计算并追加 Meta CRC (4B)
+    unsigned int meta_crc = calculate_crc32(meta_data, META_DATA_BYTES);
+    memcpy(ldpc_payload + offset, &meta_crc, META_CRC_BYTES);
+}
+
+// 固件流水线：LDPC 解码成功后，核对 CRC 以防止静默数据损坏 (SDC)
+int verify_nand_page(const unsigned char *decoded_payload) {
+    int offset = 0;
+    
+    // 1. 提取并校验 User CRC
+    unsigned int calc_user_crc = calculate_crc32(decoded_payload + offset, USER_DATA_BYTES);
+    unsigned int read_user_crc;
+    memcpy(&read_user_crc, decoded_payload + offset + USER_DATA_BYTES, USER_CRC_BYTES);
+    
+    if (calc_user_crc != read_user_crc) {
+        printf("[SDC Error] 致命错误！User Data CRC 校验失败！(LDPC 发生误纠)\n");
+        return -1;
+    }
+    offset += USER_DATA_BYTES + USER_CRC_BYTES;
+
+    // 2. 提取并校验 Meta CRC
+    unsigned int calc_meta_crc = calculate_crc32(decoded_payload + offset, META_DATA_BYTES);
+    unsigned int read_meta_crc;
+    memcpy(&read_meta_crc, decoded_payload + offset + META_DATA_BYTES, META_CRC_BYTES);
+    
+    if (calc_meta_crc != read_meta_crc) {
+        printf("[SDC Error] 致命错误！Meta Data CRC 校验失败！\n");
+        return -2;
+    }
+
+    return 0; // 完美通过双重校验
+}
+
+/* ==========================================
  * 模块 2: 编码与信道模拟
  * ========================================== */
 void ldpc_encode(const unsigned char *data_in, unsigned char *codeword_out)
 {
     int entry_idx, z_offset, data_bit_idx, parity_bit_idx;
 
-    memcpy(codeword_out, data_in, DATA_BITS);
-    memset(codeword_out + DATA_BITS, 0, PARITY_BITS);
+    memcpy(codeword_out, data_in, LDPC_PAYLOAD_BITS);
+    memset(codeword_out + LDPC_PAYLOAD_BITS, 0, PARITY_BITS);
 
     for (entry_idx = 0; entry_idx < g_rom_matrix_entries; entry_idx++)
     {
@@ -325,7 +384,7 @@ void ldpc_encode(const unsigned char *data_in, unsigned char *codeword_out)
                 (z_offset + LIFTING_FACTOR - g_rom_base_matrix[entry_idx].shift) %
                     LIFTING_FACTOR;
 
-            codeword_out[DATA_BITS + parity_bit_idx] ^= data_in[data_bit_idx];
+            codeword_out[LDPC_PAYLOAD_BITS + parity_bit_idx] ^= data_in[data_bit_idx];
         }
     }
 }
@@ -787,63 +846,90 @@ void find_optimal_matrix(int search_trials)
 /* ==========================================
  * 模块 4: 纠错极限探测 (Stress Test)
  * ========================================== */
+/* ==========================================
+ * 模块 4: 纠错极限探测 (Stress Test + SDC 监控)
+ * ========================================== */
 void test_correction_limit(const unsigned char *tx_codeword)
 {
     unsigned char *hard_rx = (unsigned char *)malloc(CODEWORD_BITS);
     double *rx_llr_channel = (double *)malloc(CODEWORD_BITS * sizeof(double));
     unsigned char *soft_out = (unsigned char *)malloc(CODEWORD_BITS);
     
-    int t, i;
+    /* --- 新增：用于存放拼凑回来的 Byte 数组 --- */
+    unsigned char *decoded_payload_bytes = (unsigned char *)malloc(LDPC_PAYLOAD_BYTES);
+    
+    int t, i, b;
     const int trials_per_snr = 20; // 每个 SNR 测试 20 次
     double snr;
 
     printf("\n[Stress Test] 启动 SNR 扫频测试 (模拟 NAND 磨损加深)...\n");
-    printf(" SNR(dB) | 硬判决成功率 | 软判决成功率 | 平均原始误码(Bits)\n");
-    printf("----------------------------------------------------------\n");
+    // 表头新增了 SDC 拦截统计
+    printf(" SNR(dB) | 硬解成功率 | 软解成功率 | 软解 SDC(误纠) | 平均原始误码\n");
+    printf("----------------------------------------------------------------------\n");
 
-    // 从极其健康的 6.5dB，一路折磨到极度衰老的 3.5dB
     for (snr = 8.0; snr >= 1.0; snr -= 0.5)
     {
         int hard_ok = 0, soft_ok = 0;
+        int soft_sdc = 0; // 记录发生误纠的次数
         int total_raw_errs = 0;
 
         for (t = 0; t < trials_per_snr; t++)
         {
-            /* 1. 统一生成带噪声的信道模拟信息 (Soft LLR) */
-            // generate_llr(tx_codeword, rx_llr_channel, snr);
             generate_quantized_llr(tx_codeword, rx_llr_channel, snr);
 
-            /* 2. 模拟 Hard Read：基于阈值 0 强行切分出 0 和 1 */
             int raw_errs = 0;
             for (i = 0; i < CODEWORD_BITS; i++) {
                 hard_rx[i] = (rx_llr_channel[i] < 0) ? 1 : 0;
-                // 顺便统计一下，这个 SNR 下物理层到底碎了多少个 bit
                 if (hard_rx[i] != tx_codeword[i]) raw_errs++; 
             }
             total_raw_errs += raw_errs;
 
-            /* 3. 公平竞技开始 */
-            // 硬判决只拿到粗糙的 hard_rx 盲解
+            /* 硬判决盲解 */
             if (ldpc_decode_hard(hard_rx) >= 0) hard_ok++;
             
-            // 软判决拿到包含丰富犹豫度信息的 LLR 细解
-            if (ldpc_decode_soft(rx_llr_channel, soft_out) >= 0) soft_ok++;
+            /* 软判决细解 */
+            if (ldpc_decode_soft(rx_llr_channel, soft_out) >= 0) {
+                
+                /* ==================================================
+                 * 关键修改：LDPC 伴随式全 0 退出后，进行最后的 CRC 验毒
+                 * ================================================== */
+                // 1. 将前 LDPC_PAYLOAD_BITS 个 Bit，按序拼凑回 Byte 数组
+                for (i = 0; i < LDPC_PAYLOAD_BYTES; i++) {
+                    unsigned char assembled_byte = 0;
+                    for (b = 0; b < 8; b++) {
+                        // 刚才打包时是 右移 取出的，现在 左移 拼回去
+                        assembled_byte |= (soft_out[i * 8 + b] << b);
+                    }
+                    decoded_payload_bytes[i] = assembled_byte;
+                }
+                
+                // 2. 将拼好的净荷送给 CRC 引擎检验
+                int verify_result = verify_nand_page(decoded_payload_bytes);
+                
+                if (verify_result == 0) {
+                    soft_ok++; // LDPC 和双 CRC 都过了，才是真正的成功！
+                } else {
+                    soft_sdc++; // 极其可怕的情况发生了：LDPC 骗了我们，但被 CRC 逮住了！
+                }
+            }
         }
 
-        printf("  %4.1f   |    %6.1f%%    |    %6.1f%%    |   ~ %d bits\n", 
+        printf("  %4.1f   |    %6.1f%%   |    %6.1f%%   |      %2d 次      |   ~ %d bits\n", 
                snr, 
                (double)hard_ok/trials_per_snr*100, 
                (double)soft_ok/trials_per_snr*100,
+               soft_sdc,
                total_raw_errs / trials_per_snr);
 
-        // 如果两个都彻底死透了，停止扫频
-        if (hard_ok == 0 && soft_ok == 0) break;
+        // 如果三个指标都死透了，停止扫频
+        if (hard_ok == 0 && soft_ok == 0 && soft_sdc == 0) break;
     }
 
-    printf("----------------------------------------------------------\n");
+    printf("----------------------------------------------------------------------\n");
     free(hard_rx);
     free(rx_llr_channel);
     free(soft_out);
+    free(decoded_payload_bytes); // 别忘了释放新加的内存
 }
 
 /* ==========================================
@@ -867,7 +953,7 @@ void firmware_raid_recovery_demo(void)
 
     /* 1. 初始化 5 个 Die 的内存，并生成用户数据 */
     for (d = 0; d < NUM_DIES; d++) {
-        raw_data[d] = (unsigned char *)malloc(DATA_BITS);
+        raw_data[d] = (unsigned char *)malloc(LDPC_PAYLOAD_BITS);
         tx_codeword[d] = (unsigned char *)malloc(CODEWORD_BITS);
         rx_llr[d] = (double *)malloc(CODEWORD_BITS * sizeof(double));
         rx_soft_out[d] = (unsigned char *)malloc(CODEWORD_BITS);
@@ -875,7 +961,7 @@ void firmware_raid_recovery_demo(void)
 
     // 填充 Die 0~3 的用户数据并进行 LDPC 编码
     for (d = 0; d < NUM_DIES - 1; d++) {
-        for (i = 0; i < DATA_BITS; i++) raw_data[d][i] = rand() % 2;
+        for (i = 0; i < LDPC_PAYLOAD_BITS; i++) raw_data[d][i] = rand() % 2;
         ldpc_encode(raw_data[d], tx_codeword[d]);
     }
 
@@ -932,7 +1018,7 @@ void firmware_raid_recovery_demo(void)
 
         // 校验恢复出的数据是否和最初存入的一模一样
         int is_perfect = 1;
-        for (i = 0; i < DATA_BITS; i++) {
+        for (i = 0; i < LDPC_PAYLOAD_BITS; i++) {
             if (recovered_die0[i] != raw_data[0][i]) {
                 is_perfect = 0; break;
             }
@@ -960,61 +1046,60 @@ void firmware_raid_recovery_demo(void)
  * ========================================== */
 int main(void)
 {
-    unsigned char *raw_data = (unsigned char *)malloc(DATA_BITS);
+    // 主机下发的数据
+    unsigned char *host_user_data = (unsigned char *)malloc(USER_DATA_BYTES);
+    // FTL 生成的元数据 (比如存了 LBA=0x12345678)
+    unsigned char *ftl_meta_data = (unsigned char *)calloc(META_DATA_BYTES, 1);
+    
+    // 准备送入 LDPC 的 4120 Bytes 净荷
+    unsigned char *ldpc_payload_bytes = (unsigned char *)malloc(LDPC_PAYLOAD_BYTES);
+    // 转换为 bit 数组 (因为我们的 LDPC 是按 bit 处理的)
+    unsigned char *ldpc_payload_bits = (unsigned char *)malloc(LDPC_PAYLOAD_BITS);
+    // 最终落盘的码字
     unsigned char *tx_codeword = (unsigned char *)malloc(CODEWORD_BITS);
-    int i;
 
-    /* 必须把随机种子放到最开头，让优化器每次都能出不同结果 */
+    int i, bit_idx;
+
     srand((unsigned)time(NULL));
-
-    printf("========================================================\n");
-    printf(" 启动固件级 LDPC 引擎能力探测仿真\n");
-    printf(" 配置: Data=%d Bytes, Parity=%d Bytes (Rate: %.2f)\n", DATA_BYTES,
-           PARITY_BYTES, (float)DATA_BYTES / (DATA_BYTES + PARITY_BYTES));
-    printf("========================================================\n");
-
-    /* 初始化 */
-    #if 0
     build_mock_rom_table();
-    if (ldpc_engine_init() < 0)
-    {
-        printf("[Error] LDPC 引擎初始化失败！\n");
-        return -1;
-    }
-    #elif 0
-    /* 召唤寻优器！让它穷举 50 种矩阵结构，选出最好的一套 */
-    find_optimal_matrix(50000);
-    #else
-    build_mock_rom_table_qc();
-    if (ldpc_engine_init() < 0)
-    {
-        printf("[Error] LDPC 引擎初始化失败！\n");
-        return -1;
-    }
-    #endif
+    if (ldpc_engine_init() < 0) return -1;
 
-    /* 随机生成宿主机数据 */
-    srand((unsigned)time(NULL));
-    for (i = 0; i < DATA_BITS; i++)
-    {
-        raw_data[i] = rand() % 2;
+    printf("========================================================\n");
+    printf(" 启动固件级 NAND 读写全流水线 (Data + Meta + CRC + LDPC)\n");
+    printf(" 配置: Payload=%d Bytes, Parity=%d Bytes\n", LDPC_PAYLOAD_BYTES, PARITY_BYTES);
+    printf("========================================================\n");
+
+    /* 1. 模拟 Host 数据与 FTL Meta 准备 */
+    for (i = 0; i < USER_DATA_BYTES; i++) host_user_data[i] = rand() % 256;
+    // 随便在 Meta 里写点东西，比如 LBA=5
+    ftl_meta_data[0] = 0x05; ftl_meta_data[1] = 0x00; 
+
+    /* 2. 流水线阶段一：打包 Data + Meta + 双重 CRC */
+    printf("\n[Pipeline] 正在打包 User Data, Meta Data 并计算各自的 CRC32...\n");
+    pack_nand_page(host_user_data, ftl_meta_data, ldpc_payload_bytes);
+
+    // 将 Byte 数组展开成 Bit 数组给 LDPC 引擎用 (为了兼容旧代码)
+    for (i = 0; i < LDPC_PAYLOAD_BYTES; i++) {
+        for (bit_idx = 0; bit_idx < 8; bit_idx++) {
+            ldpc_payload_bits[i * 8 + bit_idx] = (ldpc_payload_bytes[i] >> bit_idx) & 1;
+        }
     }
 
-    /* 编码落盘 */
-    printf("\n[FW Process] 正在执行系统码编码...\n");
-    ldpc_encode(raw_data, tx_codeword);
+    /* 3. 流水线阶段二：LDPC 编码 */
+    printf("[Pipeline] 正在执行系统码编码 (将 4120 Bytes 净荷扩张为 4632 Bytes 码字)...\n");
+    ldpc_encode(ldpc_payload_bits, tx_codeword);
 
-    /* 运行压力测试 */
+    /* 4. 执行压力测试 (你现有的测瀑布曲线的函数) */
     test_correction_limit(tx_codeword);
+    
+    // [注意]：如果你想测试 verify_nand_page，可以在 test_correction_limit 
+    // 解码成功 (ldpc_decode_soft >= 0) 的地方，把 rx_soft_out 重新拼回 
+    // Byte 数组，然后传给 verify_nand_page() 检查。
 
-    /* --- 新增：运行宏观系统容灾演习 --- */
-    firmware_raid_recovery_demo();
-
-    /* 清理退场 */
-    printf("\n[FW Process] 仿真完毕，释放资源。\n");
-    free(raw_data);
-    free(tx_codeword);
+    /* 清理 */
+    free(host_user_data); free(ftl_meta_data); free(ldpc_payload_bytes);
+    free(ldpc_payload_bits); free(tx_codeword);
     ldpc_engine_cleanup();
-
+    
     return 0;
 }
