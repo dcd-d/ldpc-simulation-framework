@@ -10,7 +10,7 @@
       "stopAtEntry": false,
       "externalConsole": false,
       "cwd": "/home/dc/code_lib/lang_c/ldpc_simulation",
-      "program": "/home/dc/code_lib/lang_c/ldpc_simulation/ldpc_simu",
+      "program": "/home/dc/code_lib/lang_c/ldpc_simulation/ssd_full_path_sim",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "preLaunchTask": "build_ldpc_simu", // <--- 关键就在这一行！
