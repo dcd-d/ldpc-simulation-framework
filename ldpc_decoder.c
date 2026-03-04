@@ -403,10 +403,110 @@ void generate_quantized_llr(const unsigned char *tx_codeword, double *llr_out, d
         llr_out[i] = g_llr_lut[lut_index];
     }
 }
+
+int ldpc_decode_hard(unsigned char *rx_codeword)
+{
+    #if 0
+    ldpc_decode_hard_pbf(rx_codeword);
+    #else
+    ldpc_decode_hard_old(rx_codeword);
+    #endif
+}
+/* ==========================================
+ * 模块 3: 核心解码算法 (升级版 PBF 硬判决)
+ * ========================================== */
+int ldpc_decode_hard_pbf(unsigned char *rx_codeword)
+{
+    unsigned char *syndrome_buf = (unsigned char *)malloc(PARITY_BITS);
+    int *fail_counts = (int *)calloc(CODEWORD_BITS, sizeof(int));
+    int iter, i, edge_idx, is_all_zero, max_fail_peak;
+    unsigned char current_syndrome;
+    
+    // --- 新增：死锁追踪器 ---
+    int last_syndrome_weight = 1e9; // 记录上一轮有多少个方程报错
+    int deadlock_counter = 0;       // 记录原地踏步了多少轮
+
+    for (iter = 0; iter < MAX_HARD_ITERS; iter++)
+    {
+        is_all_zero = 1;
+        int current_syndrome_weight = 0; // 统计当前轮的报错总数
+        
+        /* 1. 计算伴随式 */
+        for (i = 0; i < PARITY_BITS; i++)
+        {
+            current_syndrome = 0;
+            for (edge_idx = 0; edge_idx < g_check_nodes[i].degree; edge_idx++)
+            {
+                current_syndrome ^= rx_codeword[g_check_nodes[i].connected_vns[edge_idx]];
+            }
+            syndrome_buf[i] = current_syndrome;
+            if (current_syndrome != 0) {
+                is_all_zero = 0;
+                current_syndrome_weight++; // 记录报错总数
+            }
+        }
+
+        if (is_all_zero)
+        {
+            free(syndrome_buf);
+            free(fail_counts);
+            return iter + 1;
+        }
+
+        /* --- 新增：死锁状态评估 --- */
+        // 如果当前报错的方程数量，没有比上一轮少，说明我们卡在陷阱集里了
+        if (current_syndrome_weight >= last_syndrome_weight) {
+            deadlock_counter++;
+        } else {
+            deadlock_counter = 0; // 一旦有进展，立刻清零死锁计数
+        }
+        last_syndrome_weight = current_syndrome_weight;
+
+        /* 2. 统计变量节点报错次数 */
+        max_fail_peak = 0;
+        memset(fail_counts, 0, CODEWORD_BITS * sizeof(int));
+
+        for (i = 0; i < CODEWORD_BITS; i++)
+        {
+            for (edge_idx = 0; edge_idx < g_var_nodes[i].degree; edge_idx++)
+            {
+                if (syndrome_buf[g_var_nodes[i].connected_cns[edge_idx]])
+                    fail_counts[i]++;
+            }
+            if (fail_counts[i] > max_fail_peak)
+                max_fail_peak = fail_counts[i];
+        }
+
+        /* 3. 智能比特翻转 (引入概率打破对称性) */
+        if (max_fail_peak > 0)
+        {
+            for (i = 0; i < CODEWORD_BITS; i++)
+            {
+                if (fail_counts[i] == max_fail_peak)
+                {
+                    // 如果发现连续震荡超过 2 轮，我们就不再 100% 翻转
+                    // 而是用 80% 的概率去翻转它，强行撕裂陷阱集的对称结构
+                    if (deadlock_counter > 2) {
+                        if (rand() % 100 < 80) {
+                            rx_codeword[i] ^= 1;
+                        }
+                    } else {
+                        // 正常情况下，保持贪心的高效翻转
+                        rx_codeword[i] ^= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    free(syndrome_buf);
+    free(fail_counts);
+    return -1;
+}
 /* ==========================================
  * 模块 3: 核心解码算法
  * ========================================== */
-int ldpc_decode_hard(unsigned char *rx_codeword)
+int ldpc_decode_hard_old(unsigned char *rx_codeword)
 {
     unsigned char *syndrome_buf = (unsigned char *)malloc(PARITY_BITS);
     int *fail_counts = (int *)calloc(CODEWORD_BITS, sizeof(int));
