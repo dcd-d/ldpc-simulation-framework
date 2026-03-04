@@ -88,7 +88,7 @@ void build_mock_rom_table(void)
         total_entries * sizeof(struct ldpc_rom_entry));
     memset(temp_matrix, -1, sizeof(temp_matrix));
 
-    srand(12345); // 固定随机种子，保证每次调试矩阵结构一致
+    // srand(12345); // 固定随机种子，保证每次调试矩阵结构一致
     for (j = 0; j < NUM_DATA_BLOCKS; j++)
     {
         for (w = 0; w < COLUMN_WEIGHT; w++)
@@ -109,8 +109,105 @@ void build_mock_rom_table(void)
         }
     }
     g_rom_matrix_entries = current_entry;
-    printf("[Testbed] 成功生成模拟 ROM 表，包含 %d 个有效宏块。\n",
-           g_rom_matrix_entries);
+    // printf("[Testbed] 成功生成模拟 ROM 表，包含 %d 个有效宏块。\n",
+    //        g_rom_matrix_entries);
+}
+
+/* ==========================================
+ * 模块 1: 工业级 QC-LDPC 无 4 环矩阵生成器
+ * ========================================== */
+void build_mock_rom_table_qc(void)
+{
+    int j, w, row_idx, shift_val;
+    int c_prime, r_prime, diff;
+    int total_entries = NUM_DATA_BLOCKS * COLUMN_WEIGHT;
+    int current_entry = 0;
+    int temp_matrix[NUM_CHK_BLOCKS][NUM_DATA_BLOCKS];
+    int is_valid, attempts, restart_count = 0;
+
+restart_matrix:
+    if (restart_count > 5000) {
+        printf("[Fatal] Z = %d 空间太小，无法在当前列重下完全避开 4 环！\n", LIFTING_FACTOR);
+        exit(-1);
+    }
+
+    memset(temp_matrix, -1, sizeof(temp_matrix));
+    current_entry = 0;
+
+    for (j = 0; j < NUM_DATA_BLOCKS; j++)
+    {
+        for (w = 0; w < COLUMN_WEIGHT; w++)
+        {
+            /* 1. 随机找一个还没填过数据的空行 */
+            int row_attempts = 0;
+            do {
+                row_idx = rand() % NUM_CHK_BLOCKS;
+                row_attempts++;
+                // 如果随机 100 次都找不到空位，说明这列塞满了，死锁重启
+                if (row_attempts > 100) goto restart_matrix; 
+            } while (temp_matrix[row_idx][j] != -1);
+
+            /* 2. 尝试分配 Shift 移位值，并进行严格的代数同余校验 */
+            attempts = 0;
+            do {
+                shift_val = rand() % LIFTING_FACTOR;
+                is_valid = 1;
+
+                // 遍历之前所有的列 (c_prime)
+                for (c_prime = 0; c_prime < j; c_prime++) {
+                    // 必须在这两列的同一行都有数据，才可能构成 2x2 网格
+                    if (temp_matrix[row_idx][c_prime] != -1) {
+                        // 寻找另一个同时连接这两列的行 (r_prime)
+                        for (r_prime = 0; r_prime < NUM_CHK_BLOCKS; r_prime++) {
+                            if (r_prime != row_idx &&
+                                temp_matrix[r_prime][j] != -1 &&
+                                temp_matrix[r_prime][c_prime] != -1)
+                            {
+                                // 抓到了一个 2x2 的宏块！提取它们的 Shift 值
+                                int s11 = temp_matrix[r_prime][c_prime];
+                                int s12 = temp_matrix[r_prime][j];
+                                int s21 = temp_matrix[row_idx][c_prime];
+                                int s22 = shift_val; 
+
+                                // 核心公式: (S11 + S22) - (S12 + S21) = 0 mod Z
+                                diff = (s11 + s22) - (s12 + s21);
+                                if ((diff % LIFTING_FACTOR + LIFTING_FACTOR) % LIFTING_FACTOR == 0) {
+                                    is_valid = 0; // 产生 4 环！一票否决
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!is_valid) break;
+                }
+                
+                attempts++;
+                // 如果试遍了所有的 Shift 值都不行，说明走进了死胡同，全盘掀桌子重来！
+                if (attempts > LIFTING_FACTOR * 2) {
+                    restart_count++;
+                    goto restart_matrix;
+                }
+            } while (!is_valid);
+
+            /* 3. 代数校验通过，落子无悔 */
+            temp_matrix[row_idx][j] = shift_val;
+        }
+    }
+
+    /* 将二维数组转换为一维 ROM 表格给硬件引擎使用 */
+    g_rom_base_matrix = (struct ldpc_rom_entry *)malloc(total_entries * sizeof(struct ldpc_rom_entry));
+    for (j = 0; j < NUM_DATA_BLOCKS; j++) {
+        for (int i = 0; i < NUM_CHK_BLOCKS; i++) {
+            if (temp_matrix[i][j] != -1) {
+                g_rom_base_matrix[current_entry].row = i;
+                g_rom_base_matrix[current_entry].col = j;
+                g_rom_base_matrix[current_entry].shift = temp_matrix[i][j];
+                current_entry++;
+            }
+        }
+    }
+    g_rom_matrix_entries = current_entry;
+    printf("[Matrix Generator] 历经 %d 次死锁回溯，成功生成【0 个 4 环】的完美 QC 矩阵！\n", restart_count);
 }
 
 int ldpc_engine_init(void)
@@ -186,7 +283,7 @@ int ldpc_engine_init(void)
     }
 
     g_is_initialized = 1;
-    printf("[LDPC Engine] 硬件图模型初始化完毕。\n");
+    // printf("[LDPC Engine] 硬件图模型初始化完毕。\n");
     return 0;
 }
 
@@ -497,6 +594,97 @@ int ldpc_decode_soft(double *channel_llr, unsigned char *out_codeword)
 }
 
 /* ==========================================
+ * 模块 3.5: 矩阵拓扑优化器 (消除 Cycle-4)
+ * ========================================== */
+
+// 扫描当前图模型中的 4 环数量
+int count_cycle_4(void)
+{
+    int cycle4_count = 0;
+    int i, e1, e2, c1, c2, r, c;
+    
+    /* 分配一维连续内存用于统计 (4096*4096*2 bytes ≈ 33.5MB) */
+    unsigned short *shared_vns = (unsigned short *)calloc(PARITY_BITS * PARITY_BITS, sizeof(unsigned short));
+
+    /* 遍历所有变量节点，两两组合它连接的校验节点 */
+    for (i = 0; i < CODEWORD_BITS; i++) {
+        for (e1 = 0; e1 < g_var_nodes[i].degree; e1++) {
+            c1 = g_var_nodes[i].connected_cns[e1];
+            for (e2 = e1 + 1; e2 < g_var_nodes[i].degree; e2++) {
+                c2 = g_var_nodes[i].connected_cns[e2];
+                // 确保行坐标小于列坐标，只用矩阵的上三角
+                r = (c1 < c2) ? c1 : c2;
+                c = (c1 > c2) ? c1 : c2;
+                // 记录这两个校验节点共同连接的变量节点数
+                shared_vns[r * PARITY_BITS + c]++;
+            }
+        }
+    }
+
+    /* 如果有两个以上的变量节点连向了相同的一对校验节点，就算作 4 环 */
+    for (i = 0; i < PARITY_BITS * PARITY_BITS; i++) {
+        if (shared_vns[i] > 1) {
+            int k = shared_vns[i];
+            // 从 k 个节点中选 2 个的组合数: C(k, 2)
+            cycle4_count += (k * (k - 1)) / 2; 
+        }
+    }
+
+    free(shared_vns);
+    return cycle4_count;
+}
+
+// 蒙特卡洛搜索最优矩阵
+void find_optimal_matrix(int search_trials)
+{
+    int best_cycle4 = 2e9; // 初始设为无限大
+    struct ldpc_rom_entry *best_matrix = NULL;
+    int best_entries_count = 0;
+    int t, current_cycle4;
+
+    printf("\n[Matrix Optimizer] 开始搜索最优 ROM 矩阵 (基于 Cycle-4 最小化)，尝试 %d 次...\n", search_trials);
+
+    for (t = 0; t < search_trials; t++)
+    {
+        if (t % 100 == 0)
+        {
+            printf("serch %d times\n", t);
+        }
+        // 1. 生成一版随机矩阵
+        build_mock_rom_table();
+        
+        // 2. 根据这版矩阵构建物理连线图
+        if (ldpc_engine_init() < 0) return;
+
+        // 3. 统计 4 环的致命数量
+        current_cycle4 = count_cycle_4();
+
+        // 4. 如果发现更优秀的拓扑结构，保存它！
+        if (current_cycle4 < best_cycle4)
+        {
+            best_cycle4 = current_cycle4;
+            if (best_matrix) free(best_matrix);
+            
+            best_matrix = (struct ldpc_rom_entry *)malloc(g_rom_matrix_entries * sizeof(struct ldpc_rom_entry));
+            memcpy(best_matrix, g_rom_base_matrix, g_rom_matrix_entries * sizeof(struct ldpc_rom_entry));
+            best_entries_count = g_rom_matrix_entries;
+            
+            printf("  -> 发现优质矩阵! 迭代 %3d, Cycle-4 数量降低至: %d\n", t, best_cycle4);
+        }
+
+        // 清理当前连线，为下一次尝试腾出空间
+        ldpc_engine_cleanup();
+    }
+
+    printf("[Matrix Optimizer] 搜索完成！选定包含 %d 个 Cycle-4 的矩阵作为固件基线。\n", best_cycle4);
+
+    // 5. 将万里挑一的最优矩阵恢复到全局状态，并正式初始化
+    g_rom_base_matrix = best_matrix;
+    g_rom_matrix_entries = best_entries_count;
+    ldpc_engine_init();
+}
+
+/* ==========================================
  * 模块 4: 纠错极限探测 (Stress Test)
  * ========================================== */
 void test_correction_limit(const unsigned char *tx_codeword)
@@ -559,6 +747,115 @@ void test_correction_limit(const unsigned char *tx_codeword)
 }
 
 /* ==========================================
+ * 模块 5: 固件级跨 Die RAID 容灾恢复 (RAIN)
+ * ========================================== */
+#define NUM_DIES 5  // 4 个数据 Die + 1 个校验 Die
+
+void firmware_raid_recovery_demo(void)
+{
+    unsigned char *raw_data[NUM_DIES];
+    unsigned char *tx_codeword[NUM_DIES];
+    double *rx_llr[NUM_DIES];
+    unsigned char *rx_soft_out[NUM_DIES];
+    unsigned char *recovered_die0 = (unsigned char *)malloc(CODEWORD_BITS);
+    int i, d, iter;
+    int raid_success = 1;
+
+    printf("\n========================================================\n");
+    printf(" [FW RAID Flow] 启动跨 Die 异或容灾恢复演练 (4 Data + 1 Parity)\n");
+    printf("========================================================\n");
+
+    /* 1. 初始化 5 个 Die 的内存，并生成用户数据 */
+    for (d = 0; d < NUM_DIES; d++) {
+        raw_data[d] = (unsigned char *)malloc(DATA_BITS);
+        tx_codeword[d] = (unsigned char *)malloc(CODEWORD_BITS);
+        rx_llr[d] = (double *)malloc(CODEWORD_BITS * sizeof(double));
+        rx_soft_out[d] = (unsigned char *)malloc(CODEWORD_BITS);
+    }
+
+    // 填充 Die 0~3 的用户数据并进行 LDPC 编码
+    for (d = 0; d < NUM_DIES - 1; d++) {
+        for (i = 0; i < DATA_BITS; i++) raw_data[d][i] = rand() % 2;
+        ldpc_encode(raw_data[d], tx_codeword[d]);
+    }
+
+    // 计算 Die 4 的 RAID 校验页 (按位异或前 4 个 Die 的码字)
+    for (i = 0; i < CODEWORD_BITS; i++) {
+        tx_codeword[4][i] = tx_codeword[0][i] ^ tx_codeword[1][i] ^ 
+                            tx_codeword[2][i] ^ tx_codeword[3][i];
+    }
+    printf("[RAID Engine] 5 个 Die 数据已条带化写入完毕。\n");
+
+    /* 2. 模拟突发物理灾难 */
+    printf("\n[Channel] 模拟岁月侵蚀... Die 0 遭遇极度恶劣的漏电损坏！\n");
+    
+    // Die 0 给予致死量的噪声 (2.5dB)，绝对超出 LDPC 极限
+    generate_quantized_llr(tx_codeword[0], rx_llr[0], 2.5); 
+    
+    // Die 1~4 给予正常的晚期噪声 (5.5dB)，在 LDPC 软解能力范围内
+    for (d = 1; d < NUM_DIES; d++) {
+        generate_quantized_llr(tx_codeword[d], rx_llr[d], 5.5);
+    }
+
+    /* 3. Host 请求读取 Die 0 */
+    printf("\n[Host Req] 主机发起读取 LBA (映射至 Die 0)...\n");
+    iter = ldpc_decode_soft(rx_llr[0], rx_soft_out[0]);
+    if (iter < 0) {
+        printf("[LDPC Core] 警告：Die 0 软判决解码彻底失败 (UE)！\n");
+    } else {
+        printf("[LDPC Core] Die 0 解码成功 (不可能发生)。\n");
+        return;
+    }
+
+    /* 4. 固件触发 RAID 恢复状态机 */
+    printf("\n[FW Exception] 挂起 Host IO，触发后台 RAID 数据恢复流程...\n");
+    for (d = 1; d < NUM_DIES; d++) {
+        printf("  -> 正在并行抢读 Die %d ... ", d);
+        iter = ldpc_decode_soft(rx_llr[d], rx_soft_out[d]);
+        if (iter >= 0) {
+            printf("LDPC 软解成功 (耗费 %d 轮)\n", iter);
+        } else {
+            printf("LDPC 软解失败！\n");
+            raid_success = 0;
+            break;
+        }
+    }
+
+    /* 5. 执行异或重构 */
+    if (raid_success) {
+        printf("\n[RAID Engine] 所有辅助 Die 读取成功，开始执行 XOR 异或重构...\n");
+        for (i = 0; i < CODEWORD_BITS; i++) {
+            // Die0 = Die1 ^ Die2 ^ Die3 ^ Parity(Die4)
+            recovered_die0[i] = rx_soft_out[1][i] ^ rx_soft_out[2][i] ^ 
+                                rx_soft_out[3][i] ^ rx_soft_out[4][i];
+        }
+
+        // 校验恢复出的数据是否和最初存入的一模一样
+        int is_perfect = 1;
+        for (i = 0; i < DATA_BITS; i++) {
+            if (recovered_die0[i] != raw_data[0][i]) {
+                is_perfect = 0; break;
+            }
+        }
+
+        if (is_perfect) {
+            printf("[FW Output] 【神迹重现】Die 0 数据完美恢复！安全返回给 Host！避免了蓝屏灾难。\n");
+        } else {
+            printf("[FW Output] 恢复失败，数据不一致。\n");
+        }
+    } else {
+        printf("[FW Output] 【彻底死机】超过两个 Die 损坏，RAID 5 阵列崩溃，上报蓝屏 (BSOD)。\n");
+    }
+
+    /* 释放内存 */
+    for (d = 0; d < NUM_DIES; d++) {
+        free(raw_data[d]); free(tx_codeword[d]); 
+        free(rx_llr[d]); free(rx_soft_out[d]);
+    }
+    free(recovered_die0);
+}
+
+/* ==========================================
  * 主函数入口
  * ========================================== */
 int main(void)
@@ -567,6 +864,9 @@ int main(void)
     unsigned char *tx_codeword = (unsigned char *)malloc(CODEWORD_BITS);
     int i;
 
+    /* 必须把随机种子放到最开头，让优化器每次都能出不同结果 */
+    srand((unsigned)time(NULL));
+
     printf("========================================================\n");
     printf(" 启动固件级 LDPC 引擎能力探测仿真\n");
     printf(" 配置: Data=%d Bytes, Parity=%d Bytes (Rate: %.2f)\n", DATA_BYTES,
@@ -574,12 +874,24 @@ int main(void)
     printf("========================================================\n");
 
     /* 初始化 */
+    #if 0
     build_mock_rom_table();
     if (ldpc_engine_init() < 0)
     {
         printf("[Error] LDPC 引擎初始化失败！\n");
         return -1;
     }
+    #elif 0
+    /* 召唤寻优器！让它穷举 50 种矩阵结构，选出最好的一套 */
+    find_optimal_matrix(50000);
+    #else
+    build_mock_rom_table_qc();
+    if (ldpc_engine_init() < 0)
+    {
+        printf("[Error] LDPC 引擎初始化失败！\n");
+        return -1;
+    }
+    #endif
 
     /* 随机生成宿主机数据 */
     srand((unsigned)time(NULL));
@@ -594,6 +906,9 @@ int main(void)
 
     /* 运行压力测试 */
     test_correction_limit(tx_codeword);
+
+    /* --- 新增：运行宏观系统容灾演习 --- */
+    firmware_raid_recovery_demo();
 
     /* 清理退场 */
     printf("\n[FW Process] 仿真完毕，释放资源。\n");
