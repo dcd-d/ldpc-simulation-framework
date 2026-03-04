@@ -10,6 +10,7 @@
                 "${workspaceFolder}/ssd_full_path_sim",
                 "${workspaceFolder}/ssd_full_path_sim.c",
                 "-lm",                       // 链接数学库
+                "-lpthread",
                 "-O0",                       // 关闭优化，方便 GDB 逐行调试
                 "-ggdb"                      // 生成 GDB 专用调试信息
             ],
