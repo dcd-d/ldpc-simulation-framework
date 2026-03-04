@@ -256,6 +256,57 @@ void generate_llr(const unsigned char *tx_codeword, double *llr_out,
 }
 
 /* ==========================================
+ * 真实的 NAND 3-bit 软读取查表 (Look-Up Table)
+ * ========================================== */
+// 索引: {HB, SB1, SB2} 的 3-bit 组合
+const double g_llr_lut[8] = {
+    15.0,   // 000: 极强 0 (电压 > 0.6)
+    8.0,    // 001: 中等 0 (0.2 < 电压 <= 0.6)
+    0.0,    // 010: 非法状态 (物理上不可能出现的极性)
+    3.0,    // 011: 弱 0   (0 < 电压 <= 0.2)
+    -15.0,  // 100: 极强 1 (电压 < -0.6)
+    -8.0,   // 101: 中等 1 (-0.6 <= 电压 < -0.2)
+    0.0,    // 110: 非法状态
+    -3.0    // 111: 弱 1   (-0.2 <= 电压 <= 0)
+};
+
+void generate_quantized_llr(const unsigned char *tx_codeword, double *llr_out, double snr_db)
+{
+    int i;
+    double snr_linear = pow(10, snr_db / 10.0);
+    double noise_sigma = 1.0 / sqrt(2.0 * snr_linear);
+    double bpsk_symbol, rand_u1, rand_u2, awgn_noise, rx_symbol;
+    unsigned char hb, sb1, sb2, lut_index;
+
+    for (i = 0; i < CODEWORD_BITS; i++)
+    {
+        /* 1. 物理层：模拟真实的细胞电压 (带噪声) */
+        bpsk_symbol = (tx_codeword[i] == 0) ? 1.0 : -1.0;
+        rand_u1 = (double)rand() / RAND_MAX;
+        rand_u2 = (double)rand() / RAND_MAX;
+        awgn_noise = noise_sigma * sqrt(-2.0 * log(rand_u1 + 1e-9)) * cos(2.0 * M_PI * rand_u2);
+        rx_symbol = bpsk_symbol + awgn_noise;
+
+        /* 2. NAND 接口层：模拟 3-Step Soft Read (电压切片) */
+        // 假设中心读取电压 V0 = 0，内圈读取 V_inner = ±0.2，外圈读取 V_outer = ±0.6
+        
+        // HB (Hard Bit): 以 0 为界限
+        hb = (rx_symbol < 0.0) ? 1 : 0;
+        
+        // SB1 (Soft Bit 1 - 内圈): 落在 [-0.2, 0.2] 的最模糊地带为 1，否则为 0
+        sb1 = (rx_symbol > -0.2 && rx_symbol <= 0.2) ? 1 : 0;
+        
+        // SB2 (Soft Bit 2 - 外圈): 落在 [-0.6, 0.6] 之间为 1，否则为 0
+        sb2 = (rx_symbol > -0.6 && rx_symbol <= 0.6) ? 1 : 0;
+
+        /* 3. 固件逻辑层：位运算拼凑 3-bit 索引 */
+        lut_index = (hb << 2) | (sb1 << 1) | sb2;
+
+        /* 4. 译码器硬件层：查表输出离散 LLR！彻底抛弃公式！ */
+        llr_out[i] = g_llr_lut[lut_index];
+    }
+}
+/* ==========================================
  * 模块 3: 核心解码算法
  * ========================================== */
 int ldpc_decode_hard(unsigned char *rx_codeword)
@@ -471,7 +522,8 @@ void test_correction_limit(const unsigned char *tx_codeword)
         for (t = 0; t < trials_per_snr; t++)
         {
             /* 1. 统一生成带噪声的信道模拟信息 (Soft LLR) */
-            generate_llr(tx_codeword, rx_llr_channel, snr);
+            // generate_llr(tx_codeword, rx_llr_channel, snr);
+            generate_quantized_llr(tx_codeword, rx_llr_channel, snr);
 
             /* 2. 模拟 Hard Read：基于阈值 0 强行切分出 0 和 1 */
             int raw_errs = 0;
