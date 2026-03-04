@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build_ldpc_simu",      // 任务的唯一名字，后面 launch.json 要用到
+            "type": "shell",
+            "command": "gcc",                // 你的编译器
+            "args": [                        // 编译参数，拆分成数组
+                "-o",
+                "${workspaceFolder}/ldpc_simu",
+                "${workspaceFolder}/ldpc_decoder.c",
+                "-lm",                       // 链接数学库
+                "-O0",                       // 关闭优化，方便 GDB 逐行调试
+                "-ggdb"                      // 生成 GDB 专用调试信息
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "silent",          // 编译成功就不弹终端打扰你，报错了才会弹出来
+                "panel": "shared"
+            },
+            "problemMatcher": ["$gcc"]       // 让 VS Code 能识别 GCC 的报错并在代码里画红波浪线
+        }
+    ]
+}
