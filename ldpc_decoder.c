@@ -364,6 +364,35 @@ int verify_nand_page(const unsigned char *decoded_payload) {
 }
 
 /* ==========================================
+ * 模块 1.6: 物理层数据加扰器 (Data Randomizer)
+ * ========================================== */
+
+// 使用工业界常见的 PRBS15 多项式: x^15 + x^14 + 1
+// 种子 (Seed) 在真实 SSD 中通常与物理页地址 (PPA) 绑定，确保不同页的扰乱序列不同
+void nand_data_randomizer(unsigned char *data, int length, unsigned int seed) {
+    // 截取低 15 位作为 LFSR 初始状态
+    unsigned int lfsr = seed & 0x7FFF; 
+    // 零状态陷阱保护：LFSR 如果全 0 就会死锁，必须强行置 1
+    if (lfsr == 0) lfsr = 1; 
+
+    for (int i = 0; i < length; i++) {
+        unsigned char random_byte = 0;
+        for (int b = 0; b < 8; b++) {
+            // 计算多项式的反馈位
+            unsigned int bit = ((lfsr >> 14) ^ (lfsr >> 13)) & 1;
+            // 移位并补入反馈位
+            lfsr = (lfsr << 1) | bit;
+            lfsr &= 0x7FFF; // 永远保持在 15 bit 掩码范围内
+            
+            // 收集 8 个 bit 拼成一个扰乱字节
+            random_byte = (random_byte << 1) | bit;
+        }
+        // 核心：将伪随机字节与净荷数据异或！
+        data[i] ^= random_byte; 
+    }
+}
+
+/* ==========================================
  * 模块 2: 编码与信道模拟
  * ========================================== */
 void ldpc_encode(const unsigned char *data_in, unsigned char *codeword_out)
@@ -902,6 +931,11 @@ void test_correction_limit(const unsigned char *tx_codeword)
                     }
                     decoded_payload_bytes[i] = assembled_byte;
                 }
+
+                /* --- 新增：调用解扰器还原数据 --- */
+                // 必须使用写入时相同的 Seed 才能完美还原！
+                unsigned int ppa_seed = 0x1A2B; 
+                nand_data_randomizer(decoded_payload_bytes, LDPC_PAYLOAD_BYTES, ppa_seed);
                 
                 // 2. 将拼好的净荷送给 CRC 引擎检验
                 int verify_result = verify_nand_page(decoded_payload_bytes);
@@ -1077,6 +1111,11 @@ int main(void)
     /* 2. 流水线阶段一：打包 Data + Meta + 双重 CRC */
     printf("\n[Pipeline] 正在打包 User Data, Meta Data 并计算各自的 CRC32...\n");
     pack_nand_page(host_user_data, ftl_meta_data, ldpc_payload_bytes);
+
+    /* --- 新增：调用加扰器打乱数据 --- */
+    unsigned int ppa_seed = 0x1A2B; // 假设我们要写入的物理页地址是 0x1A2B
+    printf("[Pipeline] 触发 LFSR 数据扰乱器 (Seed=0x%04X)，消除规律电荷分布...\n", ppa_seed);
+    nand_data_randomizer(ldpc_payload_bytes, LDPC_PAYLOAD_BYTES, ppa_seed);
 
     // 将 Byte 数组展开成 Bit 数组给 LDPC 引擎用 (为了兼容旧代码)
     for (i = 0; i < LDPC_PAYLOAD_BYTES; i++) {
