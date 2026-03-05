@@ -204,7 +204,6 @@ void physical_program_page(PPA ppa, const unsigned char *codeword_bits)
     g_nand_flash[ppa].is_valid = 1;
 }
 
-// 可视化：打印物理 Vth 分布的 ASCII 柱状图
 // 可视化：打印物理 Vth 分布的 ASCII 柱状图 (横坐标电压，纵坐标数量)
 void print_vth_histogram(PPA ppa, const char *title)
 {
@@ -320,7 +319,7 @@ void print_vth_histogram(PPA ppa, const char *title)
     }
     printf("\n");
 
-    // 6. 【新增】：打印物理硬判决 0/1 比例统计
+    // 6. 打印物理硬判决 0/1 比例统计
     float ratio_0 = (float)count_0 / CODEWORD_BITS * 100.0f;
     float ratio_1 = (float)count_1 / CODEWORD_BITS * 100.0f;
     printf("-----------------------------------------------------------------------\n");
@@ -742,6 +741,22 @@ void ftl_read_full_path(LBA lba, Inject_err_t err)
         return;
     }
 
+    // 【新增】：统计 LDPC 翻转的 Bit 数量 (纠错量)
+    int flip_1_to_0 = 0;
+    int flip_0_to_1 = 0;
+    for (int i = 0; i < CODEWORD_BITS; i++)
+    {
+        // 提取解码前最原始的硬判决 (LLR < 0.0 代表读取的原始 Bit 为 1)
+        unsigned char raw_bit = (rx_llr[i] < 0.0) ? 1 : 0;
+        unsigned char corrected_bit = rx_soft_out_bits[i];
+        
+        if (raw_bit == 1 && corrected_bit == 0)
+            flip_1_to_0++;
+        else if (raw_bit == 0 && corrected_bit == 1)
+            flip_0_to_1++;
+    }
+    int total_flips = flip_1_to_0 + flip_0_to_1;
+
     unsigned char decoded_payload[LDPC_PAYLOAD_BYTES];
     bits_to_bytes(rx_soft_out_bits, decoded_payload, LDPC_PAYLOAD_BYTES);
 
@@ -774,7 +789,9 @@ void ftl_read_full_path(LBA lba, Inject_err_t err)
     memcpy(final_host_data, decoded_payload, 15);
     final_host_data[15] = '\0';
 
-    printf("  -> [Success] 纠错耗时 %d 轮。提取数据: \"%s\"\n", iter, final_host_data);
+    // 更新后的成功日志：一并打出 1->0 和 0->1 的翻转数量
+    printf("  -> [Success] 纠错耗时 %d 轮 [纠正 %d bits (1->0: %d, 0->1: %d)]。提取数据: \"%s\"\n", 
+           iter, total_flips, flip_1_to_0, flip_0_to_1, final_host_data);
 }
 
 void ftl_rw_test()
@@ -832,7 +849,7 @@ void ftl_rw_test()
     ftl_read_full_path(3, err);
 
     memset(&err, 0, sizeof(Inject_err_t));
-    ftl_read_full_path(4, err);
+    ftl_read_full_path(4, err); // 尝试去读那个发生了 Double Program 的 PPA 4
 
     printf("\n[Simulator] 全链路物理仿真演示完毕。\n");
 }
