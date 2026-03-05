@@ -483,13 +483,18 @@ void ftl_write_full_path(LBA lba, const unsigned char *host_user_data)
 }
 
 /* FTL 读取接口：加噪 -> 解码 -> 解扰 -> 验毒 -> 查映射 */
-void ftl_read_full_path(LBA lba)
+void ftl_read_full_path(LBA lba, int inject_meta_mismatch, int inject_seed_mismatch)
 {
     PPA target_ppa = g_l2p_table[lba];
     if (target_ppa == INVALID_PPA)
     {
         printf("[FW Read]  LBA %04d => [空数据]\n", lba);
         return;
+    }
+
+    if (inject_meta_mismatch)
+    {
+        target_ppa = target_ppa + 1;
     }
 
     printf("[FW Read]  请求读取 LBA %04d (物理寻址: PPA %04d)...\n", lba, target_ppa);
@@ -514,7 +519,16 @@ void ftl_read_full_path(LBA lba)
     // 3. 提取 Byte 并解扰
     unsigned char decoded_payload[LDPC_PAYLOAD_BYTES];
     bits_to_bytes(rx_soft_out_bits, decoded_payload, LDPC_PAYLOAD_BYTES);
-    nand_data_randomizer(decoded_payload, LDPC_PAYLOAD_BYTES, target_ppa);
+
+/* ========== 【注入开始】 ========== */
+    unsigned int descramble_seed = target_ppa;
+    if (inject_seed_mismatch)
+    {
+        // 故意传入错误的种子 (例如加 1)，导致解密失败，产生全局乱码
+        descramble_seed = target_ppa + 1; 
+    }
+    nand_data_randomizer(decoded_payload, LDPC_PAYLOAD_BYTES, descramble_seed);
+    /* ========== 【注入结束】 ========== */
 
     // 4. 双重 CRC 验毒
     int crc_res = verify_nand_page(decoded_payload);
@@ -567,19 +581,22 @@ int main(void)
     unsigned char host_buffer[USER_DATA_BYTES] = {0};
 
     strcpy((char *)host_buffer, "System Boot Up!");
-    ftl_write_full_path(10, host_buffer);
+    ftl_write_full_path(0, host_buffer);
 
     strcpy((char *)host_buffer, "File Header 100");
-    ftl_write_full_path(25, host_buffer);
+    ftl_write_full_path(1, host_buffer);
 
-    printf("\n--- 第二阶段：异地更新 (Out-of-Place Update) ---\n");
     strcpy((char *)host_buffer, "System Patched.");
-    ftl_write_full_path(10, host_buffer);
+    ftl_write_full_path(2, host_buffer);
+
+    strcpy((char *)host_buffer, "System Patched1");
+    ftl_write_full_path(3, host_buffer);
 
     printf("\n--- 第三阶段：模拟磨损后的主机读取验证 ---\n");
-    ftl_read_full_path(25);
-    ftl_read_full_path(10);
-    ftl_read_full_path(99); // 读空盘
+    ftl_read_full_path(0, 0, 0);
+    ftl_read_full_path(1, 1, 0);
+    ftl_read_full_path(2, 0, 1);
+    ftl_read_full_path(3, 1, 1);
 
     printf("\n[Simulator] 全链路演示完毕。\n");
 
