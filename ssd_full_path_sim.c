@@ -29,6 +29,10 @@
 #define MAX_ITERATIONS 20
 #define MAX_HARD_ITERS 1000
 
+//--- Scrambler 参数 ---
+#define SCRAMBLER_31_BIT 1
+// #define SCRAMBLER_15_BIT 1
+
 // --- FTL 参数 ---
 #define PAGES_PER_BLOCK 64
 #define NUM_PHYSICAL_BLOCKS 32
@@ -70,6 +74,15 @@ typedef struct
     int is_valid;
     unsigned char raw_cell_data[CODEWORD_BYTES];
 } PhysicalPage;
+
+typedef struct
+{
+    char inject_meta_mismatch;
+    char inject_erase_error;
+    char inject_unc_error;
+    char inject_crc_error;
+    char inject_all_zero_error;
+} Inject_err_t;
 
 static PhysicalPage g_nand_flash[NUM_PHYSICAL_PAGES];
 static PPA g_l2p_table[NUM_LOGICAL_PAGES];
@@ -146,10 +159,44 @@ int verify_nand_page(const unsigned char *decoded_payload)
     return 0;
 }
 
+#if SCRAMBLER_31_BIT
+/* ==========================================
+ * 模块 1.6: 工业级 PRBS31 数据加扰器 (Scrambler)
+ * ========================================== */
+void nand_data_randomizer(unsigned char *data, int length, unsigned int seed)
+{
+    // 升级 1: 魔数 (Magic Salt) 扩容至 32位，彻底打散高低位的规律
+    // 升级 2: 掩码改为 0x7FFFFFFF (31 个 1)，限制在 31-bit 空间内
+    unsigned int lfsr = (seed ^ 0x5AA55AA5) & 0x7FFFFFFF; 
+    
+    // 防全零陷阱 (此时全零碰撞的概率已经降至 21 亿分之一)
+    if (lfsr == 0)
+        lfsr = 1;
+
+    for (int i = 0; i < length; i++)
+    {
+        unsigned char random_byte = 0;
+        for (int b = 0; b < 8; b++)
+        {
+            // 升级 3: PRBS31 的核心多项式 x^31 + x^28 + 1
+            // 在 C 语言中，右移 30 位获取第 31 位，右移 27 位获取第 28 位
+            unsigned int bit = ((lfsr >> 30) ^ (lfsr >> 27)) & 1;
+            
+            // 将新 bit 推入寄存器最低位，并严格保持 31 位长度
+            lfsr = ((lfsr << 1) | bit) & 0x7FFFFFFF;
+            
+            // 收集 8 个完美白噪声 bit 拼成 1 Byte
+            random_byte = (random_byte << 1) | bit;
+        }
+        // 异或密文/明文
+        data[i] ^= random_byte;
+    }
+}
+#elif SCRAMBLER_15_BIT
 void nand_data_randomizer(unsigned char *data, int length, unsigned int seed)
 {
     unsigned int lfsr = seed & 0x7FFF;
-    lfsr = (seed ^ 0x5AA5) & 0x7FFF; 
+    lfsr = (seed ^ 0x5AA5) & 0x7FFF;
     if (lfsr == 0)
         lfsr = 1;
     for (int i = 0; i < length; i++)
@@ -164,7 +211,8 @@ void nand_data_randomizer(unsigned char *data, int length, unsigned int seed)
         data[i] ^= random_byte;
     }
 }
-
+#else
+#endif
 /* ==========================================
  * 模块 2: LDPC 引擎核心 (0环矩阵生成 + 编解码)
  * ========================================== */
@@ -483,7 +531,7 @@ void ftl_write_full_path(LBA lba, const unsigned char *host_user_data)
 }
 
 /* FTL 读取接口：加噪 -> 解码 -> 解扰 -> 验毒 -> 查映射 */
-void ftl_read_full_path(LBA lba, int inject_meta_mismatch, int inject_seed_mismatch)
+void ftl_read_full_path(LBA lba, Inject_err_t err)
 {
     PPA target_ppa = g_l2p_table[lba];
     if (target_ppa == INVALID_PPA)
@@ -492,20 +540,38 @@ void ftl_read_full_path(LBA lba, int inject_meta_mismatch, int inject_seed_misma
         return;
     }
 
-    if (inject_meta_mismatch)
+    if (err.inject_meta_mismatch)
     {
-        target_ppa = target_ppa + 1;
+        target_ppa = (target_ppa > 0) ? (target_ppa - 1) : (1);
     }
 
     printf("[FW Read]  请求读取 LBA %04d (物理寻址: PPA %04d)...\n", lba, target_ppa);
 
-    // 1. 模拟信道读取 (设定此时已磨损至 5.0dB)
-    double snr_simulate = 5.0;
+    // 1. 模拟信道读取
+    double snr_simulate = 8.0;
     unsigned char tx_codeword_bits[CODEWORD_BITS];
     double rx_llr[CODEWORD_BITS];
     unsigned char rx_soft_out_bits[CODEWORD_BITS];
 
-    bytes_to_bits(g_nand_flash[target_ppa].raw_cell_data, tx_codeword_bits, CODEWORD_BYTES);
+    unsigned char all_zero_raw_data[CODEWORD_BYTES] = {0};
+    unsigned char all_one_raw_data[CODEWORD_BYTES] = {0};
+    memset(all_zero_raw_data, 0x00, CODEWORD_BYTES);
+    memset(all_one_raw_data, 0xFF, CODEWORD_BYTES);
+    unsigned char *raw_data;
+    raw_data = g_nand_flash[target_ppa].raw_cell_data;
+    if (err.inject_all_zero_error)
+    {
+        raw_data = all_zero_raw_data;
+    }
+    if (err.inject_erase_error)
+    {
+        raw_data = all_one_raw_data;
+    }
+    if (err.inject_unc_error)
+    {
+        snr_simulate = 1.0;
+    }
+    bytes_to_bits(raw_data, tx_codeword_bits, CODEWORD_BYTES);
     generate_quantized_llr(tx_codeword_bits, rx_llr, snr_simulate);
 
     // 2. LDPC 纠错
@@ -520,12 +586,12 @@ void ftl_read_full_path(LBA lba, int inject_meta_mismatch, int inject_seed_misma
     unsigned char decoded_payload[LDPC_PAYLOAD_BYTES];
     bits_to_bytes(rx_soft_out_bits, decoded_payload, LDPC_PAYLOAD_BYTES);
 
-/* ========== 【注入开始】 ========== */
+    /* ========== 【注入开始】 ========== */
     unsigned int descramble_seed = target_ppa;
-    if (inject_seed_mismatch)
+    if (err.inject_crc_error)
     {
         // 故意传入错误的种子 (例如加 1)，导致解密失败，产生全局乱码
-        descramble_seed = target_ppa + 1; 
+        descramble_seed = target_ppa + 1;
     }
     nand_data_randomizer(decoded_payload, LDPC_PAYLOAD_BYTES, descramble_seed);
     /* ========== 【注入结束】 ========== */
@@ -560,6 +626,51 @@ void ftl_read_full_path(LBA lba, int inject_meta_mismatch, int inject_seed_misma
     printf("  -> [Success] 纠错耗时 %d 轮。CRC 验毒通过！提取前缀数据: \"%s\"\n", iter, final_host_data);
 }
 
+void ftl_rw_test()
+{
+    printf("\n--- 第一阶段：主机初始化写入 ---\n");
+    unsigned char host_buffer[USER_DATA_BYTES] = {0};
+
+    strcpy((char *)host_buffer, "System Patched0");
+    ftl_write_full_path(0, host_buffer);
+
+    strcpy((char *)host_buffer, "System Patched1");
+    ftl_write_full_path(1, host_buffer);
+
+    strcpy((char *)host_buffer, "System Patched2");
+    ftl_write_full_path(2, host_buffer);
+
+    strcpy((char *)host_buffer, "System Patched3");
+    ftl_write_full_path(3, host_buffer);
+
+    strcpy((char *)host_buffer, "System Patched4");
+    ftl_write_full_path(4, host_buffer);
+
+    printf("\n--- 第二阶段：模拟磨损后的主机读取验证 ---\n");
+
+    Inject_err_t err = {0};
+    err.inject_erase_error = 1;
+    ftl_read_full_path(0, err);
+
+    memset(&err, 0, sizeof(Inject_err_t));
+    err.inject_all_zero_error = 1;
+    ftl_read_full_path(1, err);
+
+    memset(&err, 0, sizeof(Inject_err_t));
+    err.inject_unc_error = 1;
+    ftl_read_full_path(2, err);
+
+    memset(&err, 0, sizeof(Inject_err_t));
+    err.inject_crc_error = 1;
+    ftl_read_full_path(3, err);
+
+    memset(&err, 0, sizeof(Inject_err_t));
+    err.inject_meta_mismatch = 1;
+    ftl_read_full_path(3, err);
+
+    printf("\n[Simulator] 全链路演示完毕。\n");
+}
+
 /* ==========================================
  * 测试引擎：体验完整的 SSD 固件工作流
  * ========================================== */
@@ -577,28 +688,7 @@ int main(void)
         return -1;
     ftl_init();
 
-    printf("\n--- 第一阶段：主机初始化写入 ---\n");
-    unsigned char host_buffer[USER_DATA_BYTES] = {0};
-
-    strcpy((char *)host_buffer, "System Boot Up!");
-    ftl_write_full_path(0, host_buffer);
-
-    strcpy((char *)host_buffer, "File Header 100");
-    ftl_write_full_path(1, host_buffer);
-
-    strcpy((char *)host_buffer, "System Patched.");
-    ftl_write_full_path(2, host_buffer);
-
-    strcpy((char *)host_buffer, "System Patched1");
-    ftl_write_full_path(3, host_buffer);
-
-    printf("\n--- 第三阶段：模拟磨损后的主机读取验证 ---\n");
-    ftl_read_full_path(0, 0, 0);
-    ftl_read_full_path(1, 1, 0);
-    ftl_read_full_path(2, 0, 1);
-    ftl_read_full_path(3, 1, 1);
-
-    printf("\n[Simulator] 全链路演示完毕。\n");
+    ftl_rw_test();
 
     /* 清理内存 */
     for (int i = 0; i < PARITY_BITS; i++)
